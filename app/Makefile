@@ -49,6 +49,7 @@ ifeq ($(OS),Linux)
 DIRS-$(CONFIG_VHOST) += vhost
 DIRS-y += spdk_dd
 endif
+DIRS-y += block_storage
 
 .PHONY: all clean $(DIRS-y)
 
