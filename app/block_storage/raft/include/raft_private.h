@@ -1,7 +1,3 @@
-
-#ifndef RAFT_PRIVATE_H_
-#define RAFT_PRIVATE_H_
-
 /**
  * Copyright (c) 2013, Willem-Hendrik Thiart
  * Use of this source code is governed by a BSD-style license that can be
@@ -9,19 +5,30 @@
  *
  * @file
  * @author Willem Thiart himself@willemthiart.com
- * @version 0.1
  */
+
+#ifndef RAFT_PRIVATE_H_
+#define RAFT_PRIVATE_H_
+
+#include "raft_types.h"
+
+enum {
+    RAFT_NODE_STATUS_DISCONNECTED,
+    RAFT_NODE_STATUS_CONNECTED,
+    RAFT_NODE_STATUS_CONNECTING,
+    RAFT_NODE_STATUS_DISCONNECTING
+};
 
 typedef struct {
     /* Persistent state: */
 
     /* the server's best guess of what the current term is
      * starts at zero */
-    int current_term;
+    raft_term_t current_term;
 
     /* The candidate the server voted for in its current term,
      * or Nil if it hasn't voted for any.  */
-    int voted_for;
+    raft_node_id_t voted_for;
 
     /* the log which is replicated */
     void* log;
@@ -29,47 +36,67 @@ typedef struct {
     /* Volatile state: */
 
     /* idx of highest log entry known to be committed */
-    int commit_idx;
+    raft_index_t commit_idx;
 
     /* idx of highest log entry applied to state machine */
-    int last_applied_idx;
+    raft_index_t last_applied_idx;
 
     /* follower/leader/candidate indicator */
     int state;
 
-    /* amount of time left till timeout */
-    int timeout_elapsed;
+    /* true if this server is in the candidate prevote state (§4.2.3, §9.6) */
+    int prevote;
 
+    /* start time of this server */
+    raft_time_t start_time;
+
+    /* start time of election timer */
+    raft_time_t election_timer;
+ 
     raft_node_t* nodes;
     int num_nodes;
 
     int election_timeout;
+    int election_timeout_rand;
     int request_timeout;
 
-    /* what this node thinks is the node ID of the current leader, or -1 if
-     * there isn't a known current leader. */
-    raft_node_t* current_leader;
+    /* what this node thinks is the node ID of the current leader,
+     * or -1 if there isn't a known current leader. */
+    raft_node_id_t leader_id;
+
+    /* my node ID */
+    raft_node_id_t node_id;
 
     /* callbacks */
     raft_cbs_t cb;
     void* udata;
 
-    /* my node ID */
-    raft_node_t* node;
-
     /* the log which has a voting cfg change, otherwise -1 */
-    int voting_cfg_change_log_idx;
+    raft_index_t voting_cfg_change_log_idx;
+
+    /* Our membership with the cluster is confirmed (ie. configuration log was
+     * committed) */
+    int connected;
+
+    int snapshot_in_progress;
+
+    /* Last compacted snapshot */
+    raft_index_t snapshot_last_idx;
+    raft_term_t snapshot_last_term;
+
+    /* grace period after each lease expiration time honored when we determine
+     * if a leader is maintaining leases from a majority (see raft_periodic) */
+    int lease_maintenance_grace;
+
+    /* represents the first start of this (persistent) server; not a restart */
+    int first_start;
 } raft_server_private_t;
 
-void raft_election_start(raft_server_t* me);
+int raft_become_candidate(raft_server_t* me);
+int raft_become_prevoted_candidate(raft_server_t* me_);
+int raft_is_prevoted_candidate(raft_server_t* me_);
 
-void raft_become_candidate(raft_server_t* me);
-
-void raft_become_follower(raft_server_t* me);
-
-void raft_vote(raft_server_t* me, raft_node_t* node);
-
-void raft_set_current_term(raft_server_t* me,int term);
+void raft_randomize_election_timeout(raft_server_t* me_);
 
 /**
  * @return 0 on error */
@@ -77,7 +104,7 @@ int raft_send_requestvote(raft_server_t* me, raft_node_t* node);
 
 int raft_send_appendentries(raft_server_t* me, raft_node_t* node);
 
-void raft_send_appendentries_all(raft_server_t* me_);
+int raft_send_appendentries_all(raft_server_t* me_);
 
 /**
  * Apply entry at lastApplied + 1. Entry becomes 'committed'.
@@ -88,21 +115,27 @@ int raft_apply_entry(raft_server_t* me_);
  * Appends entry using the current term.
  * Note: we make the assumption that current term is up-to-date
  * @return 0 if unsuccessful */
-int raft_append_entry(raft_server_t* me_, raft_entry_t* c);
+int raft_append_entries(raft_server_t* me, raft_entry_t* entries, int *n);
 
-void raft_set_last_applied_idx(raft_server_t* me, int idx);
+void raft_set_last_applied_idx(raft_server_t* me, raft_index_t idx);
 
 void raft_set_state(raft_server_t* me_, int state);
 
 int raft_get_state(raft_server_t* me_);
 
-raft_node_t* raft_node_new(void* udata, int id);
+/**
+ * @return 1 if node ID matches the server; 0 otherwise */
+int raft_is_self(raft_server_t* me_, raft_node_t* node);
 
-void raft_node_set_next_idx(raft_node_t* node, int nextIdx);
+raft_node_t* raft_node_new(void* udata, raft_node_id_t id);
 
-void raft_node_set_match_idx(raft_node_t* node, int matchIdx);
+void raft_node_free(raft_node_t* me_);
 
-int raft_node_get_match_idx(raft_node_t* me_);
+void raft_node_set_next_idx(raft_node_t* node, raft_index_t nextIdx);
+
+void raft_node_set_match_idx(raft_node_t* node, raft_index_t matchIdx);
+
+raft_index_t raft_node_get_match_idx(raft_node_t* me_);
 
 void raft_node_vote_for_me(raft_node_t* me_, const int vote);
 
@@ -110,8 +143,24 @@ int raft_node_has_vote_for_me(raft_node_t* me_);
 
 void raft_node_set_has_sufficient_logs(raft_node_t* me_);
 
-int raft_node_has_sufficient_logs(raft_node_t* me_);
+void raft_node_set_lease(raft_node_t* me_, raft_time_t lease);
+
+void raft_node_set_effective_time(raft_node_t* me_, raft_time_t effective_time);
+
+raft_time_t raft_node_get_effective_time(raft_node_t* me_);
 
 int raft_votes_is_majority(const int nnodes, const int nvotes);
+
+int raft_count_votes(raft_server_t* me_);
+
+void raft_offer_log(raft_server_t* me_, raft_entry_t* entries,
+                    int n_entries, raft_index_t idx);
+
+void raft_pop_log(raft_server_t* me_, raft_entry_t* entries,
+                  int n_entries, raft_index_t idx);
+
+raft_index_t raft_get_num_snapshottable_logs(raft_server_t* me_);
+
+int raft_get_entry_term(raft_server_t* me_, raft_index_t idx, raft_term_t* term);
 
 #endif /* RAFT_PRIVATE_H_ */

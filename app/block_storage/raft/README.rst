@@ -10,7 +10,7 @@ See `raft.h <https://github.com/willemt/raft/blob/master/include/raft.h>`_ for f
 
 See `ticketd <https://github.com/willemt/ticketd>`_ for real life use of this library.
 
-Networking is out of scope for this project. The implementor will need to do all the plumbing.
+Networking is out of scope for this project. The implementor will need to do all the plumbing. The library doesn't assume a network layer with ordering or duplicate detection. This means you could use UDP for transmission.
 
 There are no dependencies, however https://github.com/willemt/linked-List-queue is required for testing.
 
@@ -28,9 +28,27 @@ Quality Assurance
 We use the following methods to ensure that the library is safe:
 
 * A `simulator <https://github.com/willemt/virtraft>`_ is used to test the Raft invariants on unreliable networks
+* `Fuzzing/property-based-testing <https://github.com/willemt/virtraft/blob/master/tests/test_fuzzer.py>`_ via `Hypothesis <https://github.com/DRMacIver/hypothesis/>`_
 * All bugs have regression tests
 * Many unit tests
 * `Usage <https://github.com/willemt/ticketd>`_
+
+Single file amalgamation
+========================
+
+The source has been amalgamated into a single ``raft.h`` header file.
+Use `clib <https://github.com/clibs/clib>`_ to download the source into your project's ``deps`` folder, ie:
+
+.. code-block:: bash
+
+    brew install clib
+    clib install willemt/raft_amalgamation
+
+The file is stored in the ``deps`` folder like below:
+
+.. code-block:: bash
+
+    deps/raft/raft.h
 
 How to integrate with this library
 ==================================
@@ -44,11 +62,12 @@ Be aware that this library is not thread safe. You will need to ensure that the 
 Initializing the Raft server
 ----------------------------
 
-Instantiate a new Raft server using ``raft_new``.
+Instantiate a new Raft server using ``raft_new`` and ``raft_set_nodeid``.
 
 .. code-block:: c
 
     void* raft = raft_new();
+    raft_set_nodeid(raft, self_node_id);
 
 We tell the Raft server what the cluster configuration is by using the ``raft_add_node`` function. For example, if we have 5 servers [#]_ in our cluster, we call ``raft_add_node`` 5 [#]_ times.
 
@@ -59,8 +78,8 @@ We tell the Raft server what the cluster configuration is by using the ``raft_ad
 Where:
 
 * ``connection_user_data`` is a pointer to user data.
-* ``peer_is_self`` is boolean indicating that this is the current server's server index.
-* ``node_id`` is the unique integer ID of the node. Peers use this to identify themselves.
+* ``peer_is_self`` is boolean indicating that this is the current server's server index. This MUST be consistent with the raft_set_nodeid call above.
+* ``node_id`` is the unique integer ID of the node. Peers use this to identify themselves. This SHOULD be a random integer.
 
 .. [#] AKA "Raft peer"
 .. [#] We have to also include the Raft server itself in the raft_add_node calls. When we call raft_add_node for the Raft server, we set peer_is_self to 1. 
@@ -72,7 +91,7 @@ We need to call ``raft_periodic`` at periodic intervals.
 
 .. code-block:: c
 
-    raft_periodic(raft, 1000);
+    raft_periodic(raft);
 
 *Example using a libuv timer:*
 
@@ -80,7 +99,7 @@ We need to call ``raft_periodic`` at periodic intervals.
 
     static void __periodic(uv_timer_t* handle)
     {
-        raft_periodic(sv->raft, PERIOD_MSEC);
+        raft_periodic(sv->raft);
     }
 
     uv_timer_t *periodic_req;
@@ -388,26 +407,54 @@ The table below shows the structs that you need to deserialize-to or deserialize
 
 Membership changes
 ------------------
+Membership changes are managed on the Raft log. You need two log entries to add a server to the cluster. While to remove you only need one log entry. There are two log entries for adding a server because we need to ensure that the new server's log is up to date before it can take part in voting.
+
+It's highly recommended that when a node is added to the cluster that its node ID is random. This is especially important if the server was once connected to the cluster.
 
 **Adding a node**
 
 1. Append the configuration change using ``raft_recv_entry``. Make sure the entry has the type set to ``RAFT_LOGTYPE_ADD_NONVOTING_NODE``
 
-2. Inside the ``log_offer`` callback, when a log with type ``RAFT_LOGTYPE_ADD_NONVOTING_NODE`` is detected, we add a non-voting node by calling ``raft_add_non_voting_node``.
-
-3. Once ``node_has_sufficient_logs`` callback fires, append a configuration finalization log entry using ``raft_recv_entry``. Make sure the entry has a type set to ``RAFT_LOGTYPE_ADD_NODE``
-
-4. Inside the ``log_offer`` callback, when you receive a log with type ``RAFT_LOGTYPE_ADD_NODE``, we then set the node to voting by using ``raft_add_node``
+2. Once ``node_has_sufficient_logs`` callback fires, append a configuration finalization log entry using ``raft_recv_entry``. Make sure the entry has a type set to ``RAFT_LOGTYPE_PROMOTE_NODE``
 
 **Removing a node**
 
-1. Append the configuration change using ``raft_recv_entry``. Make sure the entry has the type set to ``RAFT_LOGTYPE_REMOVE_NODE``
+1. Append the configuration change using ``raft_recv_entry``. Make sure the entry has the type set to ``RAFT_LOGTYPE_REMOVE_NODE`` for a voting node or ``RAFT_LOGTYPE_REMOVE_NONVOTING_NODE`` for a non-voting node (e.g., one that was added but not promoted, or one that was demoted with RAFT_LOGTYPE_DEMOTE_NODE).
 
-2. Inside the ``log_offer`` callback, when a log with type ``RAFT_LOGTYPE_REMOVE_NODE`` is detected, we remove the node by calling ``raft_remove_node``
+2. Once the configuration change log is applied in the ``applylog`` callback we shutdown the server if it is to be removed.
 
-3. Once the ``RAFT_LOGTYPE_REMOVE_NODE`` configuration change log is applied in the ``applylog`` callback we shutdown the server if it is to be removed.
+**Membership callback**
 
-Todo
-====
+The ``notify_membership_event`` callback can be used to track nodes as they are added and removed as a result of configuration change log entries. A typical use case is to create and destroy connections to nodes, using connection information obtained from the configuration change log entry.
 
-- Log compaction
+Log Compaction
+--------------
+The log compaction method supported is called "Snapshotting for memory-based state machines" (Ongaro, 2014)
+
+The user has to implement the ``send_installsnapshot``, ``recv_installsnapshot``, and ``recv_installsnapshot_response`` callbacks, in a way similar to those for appendentries messages. The implementor has to serialize and deserialize the snapshot, send it in chunks, and determine the completeness of a snapshot transfer.
+
+The process works like this:
+
+1. Begin snapshotting with ``raft_begin_snapshot``.
+2. Save the current membership details to the snapshot.
+3. Save the finite state machine to the snapshot.
+4. End snapshotting with ``raft_end_snapshot``.
+5. When the ``send_installsnapshot`` callback fires, the user must propogate a chunk of the snapshot to the other node by ``msg_installsnapshot_t`` and implementation-specific additional arguments (e.g., the offset of the chunk).
+6. When the peer receives the chunk, the user must call ``raft_recv_installsnapshot``. When ``recv_installsnapshot`` fires, the user must process the chunk and fill any implementation-specific arguments to the response.
+7. When the ``recv_installsnapshot_response`` callback fires, the user must record the progress of the snapshot transfer, typically in the user data of the ``raft_node_t`` object for the peer.
+8. Once the peer has the complete snapshot, the user must call ``raft_begin_load_snapshot``.
+9. Peer calls ``raft_add_node`` to add nodes as per the snapshot's membership info.
+10. Peer calls ``raft_node_set_voting`` to nodes as per the snapshot's membership info.
+
+When a node receives a snapshot it could reuse that snapshot itself for other nodes.
+
+Roadmap
+=======
+
+* Batch friendly interfaces - we can speed up Raft by adding new APIs that support batching many log entries
+* Implementing linearizable semantics (Ongaro, 2014)
+* Processing read-only queries more efficiently (Ongaro, 2014)
+
+References
+==========
+Ongaro, D. (2014). Consensus: bridging theory and practice. Retrieved from https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf
